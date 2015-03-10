@@ -24,138 +24,93 @@
 #include "http_connection.h"
 #include "util_script.h"
 
-#ifdef TWOLAME
-#include "twolame.h"
-#else
-#include "lame.h"
-#endif
+#include <curl/curl.h>
+#include "cJSON.h"
 
 #include "apr_strings.h"
-#include "hls_file.h"
-#include "hls_media.h"
-#include "hls_mux.h"
 #include "mod_conf.h"
 
 #include <stdio.h>
 
-double get_clock(){
-	struct timeval ts;
-	gettimeofday(&ts, NULL);
-	return ts.tv_sec + (double)(ts.tv_usec) / 1000000.0;
-}
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 
-/*--------------------------------------------------------------------------*/
-/*                                                                          */
-/* Data declarations.                                                       */
-/*                                                                          */
-/* Here are the static cells and structure declarations private to our      */
-/* module.                                                                  */
-/*                                                                          */
-/*--------------------------------------------------------------------------*/
-
+const char sc_filter_name[] = "SightCall";
+const char SC_HANDLER_NAME[] = "SIGHTCALL";
 /*
  * Declare ourselves so the configuration routines can find and know us.
  * We'll fill it in at the end of the module.
  */
-module AP_MODULE_DECLARE_DATA hls_module;
-
-/*--------------------------------------------------------------------------*/
-/*                                                                          */
-/* These routines are strictly internal to this module, and support its     */
-/* operation.  They are not referenced by any external portion of the       */
-/* server.                                                                  */
-/*                                                                          */
-/*--------------------------------------------------------------------------*/
+module AP_MODULE_DECLARE_DATA sc_module;
 
 
-static void remove_last_extension(char* filename){
-    int len = strlen(filename);
-    int pos = len - 1;
-    while (pos >= 0 && filename[pos]!='.')
-    	--pos;
-    filename[pos] = 0;
-}
+typedef struct context_t{
+	char 	audio_buffer[32000];
+	char 	video_buffer[200000];
 
-int is_letter(char c){
-	if (c >= '0' && c <= '9')
-		return 1;
-	if (c >= 'a' && c <= 'z')
-		return 1;
-	if (c >= 'A' && c <= 'Z')
-		return 1;
-	return 0;
-}
 
-char int_to_hex(int v){
-	switch(v){
-		case 0:
-			return '0';
-		case 1:
-			return '1';
-		case 2:
-			return '2';
-		case 3:
-			return '3';
-		case 4:
-			return '4';
-		case 5:
-			return '5';
-		case 6:
-			return '6';
-		case 7:
-			return '7';
-		case 8:
-			return '8';
-		case 9:
-			return '9';
-		case 10:
-			return 'A';
-		case 11:
-			return 'B';
-		case 12:
-			return 'C';
-		case 13:
-			return 'D';
-		case 14:
-			return 'E';
-		case 15:
-			return 'F';
+	char* 	buffer;
+	int 	buffer_size;
 
+	int 	buffer_pos;
+	int 	sent;
+
+	int 	pts;
+	int 	prev_pts;
+
+	cJSON* 	cfg;
+	int 	segment;
+	int 	segment_duration; //in milliseconds
+	char* 	stream_name;
+	int 	eos;
+	AVFormatContext* format_ctx;
+} context_t;
+
+typedef struct buf_t{
+	int 	pos;
+	char* 	buf;
+	int 	buf_size;
+} buf_t;
+
+static CURLcode curl_post_segment(
+								const char* vb_api_url,
+								const char* version,
+								const char* apikey,
+								const char* password,
+								const char* action,
+								const char* callID,
+								const char* segmentNumber,
+								const char* finalSegment,
+								const char* rtCallbackURL,
+								const char* content_name,
+								const char* content_buff,
+								long content_size,
+								const char* pub,
+								const char* title,
+								const char* time_str,
+								const char* desc,
+								const char* lang,
+								const char* sourceUrl,
+								const char* recordedDate,
+								const char* externalId,
+								const char* ownerId,
+								const char* autoCreate,
+								const char* humanRush,
+								const char* transcriptType,
+
+								char* status_str,
+								int status_max_size);
+
+static size_t RecvCallBack ( char *ptr, size_t size, size_t nmemb, char *data ) {
+	struct buf_t* buf = (struct buf_t*)data;
+	if (buf->pos + size*nmemb < buf->buf_size){
+		memcpy(&buf->buf[buf->pos],ptr, size*nmemb);
+		buf->pos += size*nmemb;
 	}
-	return '0';
+
+	return size * nmemb;
 }
 
-void convert_to_hex(char* res, unsigned char c){
-	int c1 = c >> 4;
-	int c2 = (c & 0xF);
-
-	res[0] = '%';
-	res[1] = int_to_hex(c1);
-	res[2] = int_to_hex(c2);
-
-}
-
-static char* get_pure_filename(request_rec *r, char* filename){
-    int len = strlen(filename);
-    int pos = len - 1;
-    while (pos >= 0 && filename[pos]!='/')
-    	--pos;
-    return &filename[pos + 1];
-}
-
-static int get_real_filename(char* filename){ //return segment number
-//the filename ends at _%d.ts
-    int len = strlen(filename);
-    int pos = len - 1;
-    int segment = 0;
-    while (pos >= 0 && filename[pos]!='_')
-    	--pos;
-    filename[pos] = 0;
-
-    sscanf(&filename[pos+1], "%d.ts", &segment);
-
-    return segment;
-}
 
 int check_exist(request_rec *r, const char* filename){
 	int rc;
@@ -165,50 +120,464 @@ int check_exist(request_rec *r, const char* filename){
 	if (rc == APR_SUCCESS) {
 		exists = ( (finfo.filetype != APR_NOFILE) &&  !(finfo.filetype & APR_DIR) );
 		if (exists)
-			return 1;
+			return finfo.size;
 	}
+	return -1;
+}
+
+
+cJSON* load_config(request_rec* r, char* config_file){
+	int config_file_size = check_exist(r, config_file);
+	if (config_file_size > 0){
+		char* data = apr_palloc(r->pool, config_file_size);
+		cJSON* res = cJSON_Parse(data);
+		return res;
+	}
+	return NULL;
+}
+
+int get_safe_integer(cJSON* obj, char* name, int default_val){
+	if (obj){
+		cJSON* f = cJSON_GetObjectItem(obj, name);
+		if (f){
+			return f->valueint;
+		}
+	}
+	return default_val;
+}
+
+const char* get_safe_string(cJSON* obj, char* name, char* default_val){
+	if (obj){
+		cJSON* f = cJSON_GetObjectItem(obj, name);
+		if (f){
+			return f->valuestring;
+		}
+	}
+	return default_val;
+}
+
+const char *get_time(){
+	return "00:00:00";
+}
+
+int send_segment(struct context_t* ctx, char* data, int len){
+	char segmentNumber[12];
+	char status_str[1024];
+	char content_name[1024];
+
+	const char* vb_api_url 		= get_safe_string(ctx->cfg, "API_URL", NULL);
+	const char* version 		= get_safe_string(ctx->cfg, "Version", NULL);
+	const char* apikey 			= get_safe_string(ctx->cfg, "Key", NULL);
+	const char* password 		= get_safe_string(ctx->cfg, "pw", NULL);
+	const char* pub 			= get_safe_string(ctx->cfg, "public", NULL);
+	const char* rtCallbackURL   = get_safe_string(ctx->cfg, "rtCallBackURL", NULL);
+	const char* transcriptType  = get_safe_string(ctx->cfg, "transcriptType", "machine");
+	const char* time_str 		= get_time();
+	const char* desc 		 	= get_safe_string(ctx->cfg, "description", NULL);
+	const char* lang 		 	= get_safe_string(ctx->cfg, "language", NULL);
+	const char* sourceUrl 	 	= get_safe_string(ctx->cfg, "sourceURL", NULL);
+	const char* recordedDate 	= get_safe_string(ctx->cfg, "recordedDate", NULL);
+	const char* externalId 	 	= get_safe_string(ctx->cfg, "externalID", NULL);
+	const char* ownerId		 	= get_safe_string(ctx->cfg, "ownerID", NULL);
+	const char* autoCreate 	 	= get_safe_string(ctx->cfg, "autoCreate", NULL);
+	const char* humanRush 	 	= get_safe_string(ctx->cfg, "humanRush", NULL);
+
+	snprintf(segmentNumber, sizeof(segmentNumber), "%d", ctx->segment );
+//	itoa(segmentNumber, ctx->segment, 10);
+
+	snprintf(content_name, sizeof(content_name), "%s.webm", ctx->stream_name);
+
+	if (vb_api_url && version && apikey && password && pub && rtCallbackURL && transcriptType &&
+			time_str && desc && lang && sourceUrl && recordedDate && externalId && ownerId	&&  autoCreate && humanRush)
+	{
+		if (curl_post_segment( vb_api_url,
+							"1.1",
+							apikey,
+							password,
+							"uploadMedia",
+							ctx->stream_name,//			const char* callID,
+							segmentNumber,
+							len == 0 ? "true" : "false",// 			const char* finalSegment,
+							rtCallbackURL,
+							content_name,
+							ctx->buffer,
+							ctx->buffer_size,
+							pub,
+							ctx->stream_name,
+							time_str,
+							desc,
+							lang,
+							sourceUrl,
+							recordedDate,
+							externalId,
+							ownerId,
+							autoCreate,
+							humanRush,
+							transcriptType,
+							status_str,
+							sizeof(status_str)) ==  CURLE_OK){
+			++ctx->segment;
+		}else{
+	//		printf error;
+		}
+	}else{
+	//	printf error
+	}
+}
+
+int context_init(request_rec* r, char* config, struct context_t* ctx, char* stream_name){
+	ctx->buffer_pos 	= 0;
+	ctx->sent 			= 0;
+	ctx->pts 			= 0;
+	ctx->prev_pts 		= 0;
+	ctx->segment_duration = 120000;
+	ctx->segment		= 0;
+	ctx->eos			= 0;
+	ctx->cfg 			= load_config(r, config);
+	ctx->buffer_size 	= get_safe_integer(ctx->cfg, "BufferSize", 1000000);
+	ctx->buffer 		= apr_palloc(r->connection->pool, ctx->buffer_size);
+	ctx->stream_name	= apr_palloc(r->connection->pool, strlen(stream_name)+1);
+	strcpy(ctx->stream_name, stream_name);
 	return 0;
 }
 
-int hex_to_int(char c){
-	switch (c){
-		case '0': return 0;
-		case '1': return 1;
-		case '2': return 2;
-		case '3': return 3;
+apr_status_t context_close(void* ctx){
 
-		case '4': return 4;
-		case '5': return 5;
-		case '6': return 6;
-		case '7': return 7;
+	struct context_t* context = (context_t*)ctx;
 
-		case '8': return 8;
-		case '9': return 9;
-		case 'a':
-		case 'A': return 10;
-
-		case 'b':
-		case 'B': return 11;
-
-
-		case 'c':
-		case 'C': return 12;
-
-		case 'd':
-		case 'D': return 13;
-
-		case 'e':
-		case 'E': return 14;
-
-		case 'f':
-		case 'F': return 15;
-
+	send_segment(context, NULL, 0);
+	if (context->cfg){
+		cJSON_Delete(context->cfg);
+		context->cfg = NULL;
 	}
+
+	return APR_SUCCESS;
+}
+
+/* add a video output stream */
+static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id, int bitrate, int width, int height, int fps, int gop_size, int pix_fmt, int profile, int level, int buffer_size)
+{
+	AVCodecContext *c;
+	AVStream *st;
+
+	st = avformat_new_stream(oc, 0);
+	if (!st) {
+		fprintf(stderr, "Could not alloc stream\n");
+		return NULL;
+	}
+
+	c = st->codec;
+	c->codec_id = codec_id;
+	c->codec_type = AVMEDIA_TYPE_VIDEO;
+
+	/* put sample parameters */
+	c->bit_rate 		= bitrate;
+	c->pkt_timebase.num = 1;
+	c->pkt_timebase.den = fps;
+
+
+	/* resolution must be a multiple of two */
+	c->width 		= width;
+	c->height 		= height;
+	c->coded_width	= width;
+	c->coded_height = height;
+
+	/* time base: this is the fundamental unit of time (in seconds) in terms
+	of which frame timestamps are represented. for fixed-fps content,
+	timebase should be 1/framerate and timestamp increments should be
+	identically 1. */
+	c->time_base.den = fps;
+	c->time_base.num = 1;
+
+	c->gop_size		= gop_size;
+	c->ticks_per_frame = 1;
+	c->flags		= 0;
+	c->flags2		= 0;
+	c->rc_buffer_size = buffer_size;
+	c->extradata_size = 0;
+
+	if (c->rc_buffer_size == 0){
+		c->rc_buffer_size = 90000000;
+	}
+
+
+	st->discard 		= AVDISCARD_NONE;
+	st->need_parsing 	= AVSTREAM_PARSE_FULL;
+	st->start_time		= 0;
+	st->time_base		= c->time_base;
+	st->cur_dts 		= 0;
+
+
+	// some formats want stream headers to be separate
+	if(oc->oformat->flags & AVFMT_GLOBALHEADER)
+		c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+
+	return st;
+}
+
+/* add a video output stream */
+static AVStream *add_audio_stream(AVFormatContext *oc, enum AVCodecID codec_id, int bitrate, int sample_rate, int channels)
+{
+	AVCodecContext *c;
+	AVStream *st;
+
+	st = avformat_new_stream(oc, 0);
+	if (!st) {
+		fprintf(stderr, "Could not alloc stream\n");
+		return NULL;
+	}
+
+	c = st->codec;
+	c->codec_id = codec_id;
+	c->codec_type = AVMEDIA_TYPE_AUDIO;
+	//c->codec = avcodec_find_decoder(codec_id);
+	//c->codec_tag =
+
+	/* put sample parameters */
+	c->bit_rate 	= bitrate;
+	c->pkt_timebase.num = 1;
+	c->pkt_timebase.den = sample_rate;
+
+	/* time base: this is the fundamental unit of time (in seconds) in terms
+	of which frame timestamps are represented. for fixed-fps content,
+	timebase should be 1/framerate and timestamp increments should be
+	identically 1. */
+	c->time_base = c->pkt_timebase;
+
+	c->sample_fmt  =  AV_SAMPLE_FMT_FLTP;
+	c->sample_rate = sample_rate;
+	c->channels	   = channels;
+	c->channel_layout = av_get_default_channel_layout(channels);
+//	c->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL; /* AAC */
+	c->extradata_size = 0;
+
+	st->start_time		= 0;
+	st->time_base		= c->pkt_timebase;
+	st->cur_dts 		= 0;
+
+	// some formats want stream headers to be separate
+	if(oc->oformat->flags & AVFMT_GLOBALHEADER)
+		c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+
+	return st;
+}
+
+int CloseOutputContainer(AVFormatContext* OutFmtCtx, uint8_t **buffer){
+	av_write_trailer(OutFmtCtx);
+	 /* free the streams */
+	for(int i = 0; i < OutFmtCtx->nb_streams; i++) {
+		av_freep(&OutFmtCtx->streams[i]->codec);
+		av_freep(&OutFmtCtx->streams[i]);
+	}
+
+	if (!(OutFmtCtx->oformat->flags & AVFMT_NOFILE)) {
+		/* close the output file */
+		int size = avio_close_dyn_buf(OutFmtCtx->pb, buffer);
+		av_free(OutFmtCtx);
+		return size;
+	}
+
+	/* free the stream */
+	av_free(OutFmtCtx);
 	return 0;
 }
 
-char convert_str_to_char(char c1, char c2){
-	return (hex_to_int(c1) << 4) | hex_to_int(c2);
+int CreateOutputContainer(AVFormatContext** OutFmtCtx){
+	AVOutputFormat *fmt;
+	AVFormatContext *oc;
+
+	char* out_format_name = NULL;
+	out_format_name = "webm";
+	if (out_format_name){
+		fmt = av_guess_format(out_format_name, NULL, NULL);
+		if (!fmt) {
+			fprintf(stderr, "Could not find suitable output format for format %s\n", out_format_name);
+			return 0;
+		}
+	}
+//	else{
+//		fmt = av_guess_format(NULL, filename, NULL);
+//		if (!fmt) {
+//			fprintf(stderr, "Could not find suitable output format\n");
+//			return false;
+//		}
+//	}
+
+/* allocate the output media context */
+	oc = avformat_alloc_context();
+	if (!oc) {
+		fprintf(stderr, "Memory error\n");
+		return 0;
+	}
+	oc->oformat = fmt;
+//	snprintf(oc->filename, sizeof(oc->filename), "%s", filename);
+	oc->filename[0] =0;
+/* add the audio and video streams using the default format codecs and initialize the codecs */
+	AVStream* video_st = add_video_stream(oc, AV_CODEC_ID_VP8, 400000, 640, 360, 25, 12, AV_PIX_FMT_YUV420P,  0,0, 400000);
+	AVStream* audio_st = add_audio_stream(oc, AV_CODEC_ID_OPUS, 64000, 48000, 1);
+
+	//fmt->flags |= AVFMT_TS_NONSTRICT;
+
+	if (!(fmt->flags & AVFMT_NOFILE)) {
+		if (avio_open_dyn_buf(&oc->pb) < 0) {
+			fprintf(stderr, "Could not open memory stream\n");
+			return 0;
+		}
+	}
+	/* set the output parameters (must be done even if no
+		parameters). */
+	if (avformat_write_header(oc, NULL) < 0) {
+		fprintf(stderr, "Invalid output format parameters\n");
+		return 0;
+	}
+
+//	av_dump_format(oc, 0, NULL, 1);
+	*OutFmtCtx = oc;
+	return 1;
+}
+
+int write_packet(AVFormatContext* OutFmtCtx, AVPacket* packet){
+	/* write the compressed frame in the media file */
+	if (av_interleaved_write_frame(OutFmtCtx, packet) != 0){
+		fprintf(stderr, "Error while writing frame\n");
+		return 0;
+	}
+	return 1;
+}
+
+void write_video(uint8_t* buffer, int len, int pts, int stream_index, AVFormatContext* ctx){
+	AVPacket packet;
+	memset(&packet, 0, sizeof(packet));
+
+	packet.data = buffer;
+
+	packet.size = len;
+	packet.stream_index = stream_index;
+	packet.pts = packet.dts = pts + 5;
+	write_packet(ctx, &packet);
+}
+
+void write_audio(uint8_t* buffer, int len, int pts, int stream_index, AVFormatContext* ctx){
+	AVPacket packet;
+	memset(&packet, 0, sizeof(packet));
+
+	packet.data = buffer;
+	packet.size = len;
+	packet.stream_index = stream_index;
+	packet.pts = packet.dts = pts;
+	write_packet(ctx, &packet);
+}
+
+
+int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
+
+	if (!ctx->format_ctx){
+		 if (!CreateOutputContainer(&ctx->format_ctx)){
+		    	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
+		 }
+	}
+	if (!ctx->eos){
+		memcpy(&ctx->buffer[ctx->buffer_pos], data, len);
+		ctx->buffer_pos += len;
+
+		data = &ctx->buffer[0];
+		len  = ctx->buffer_pos;
+
+	}
+
+
+	while(!ctx->eos){
+		if (len < 1 + 4 + 4){
+			break;
+		}
+		unsigned int type = data[0];
+		unsigned int index = ((unsigned int*)&data[1])[0];
+		unsigned int clen = ((unsigned int*)&data[1+4])[0];
+
+//			fprintf(stderr, "type= %d, index=%d, len = %d\n", type, index, len);
+		if ( len + 1 + 4 + 4 < clen){
+			break;
+		}
+
+		data += 1+4+4;
+
+		switch(type){
+			case 0x00://control;
+				{
+					int cc = data[0];
+					if (cc == 0xFF)
+						ctx->eos = 1;
+				}
+				break;
+			case 0x80://audio
+				//move_to_file(fin,fout, len);
+
+				write_audio(data, clen, ctx->pts, 1, ctx->format_ctx);
+				ctx->pts += 20;
+				break;
+			case 0x90://video
+
+				if (data[0] & 0x01 == 0){ //I frame
+					if (ctx->pts - ctx->prev_pts > ctx->segment_duration){
+						uint8_t* buffer = NULL;
+						int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
+
+						if (stream_len > 0 && buffer){
+							send_segment(ctx, buffer, stream_len);
+							av_free(buffer);
+						}
+						ctx->format_ctx = NULL;
+						if (!CreateOutputContainer(&ctx->format_ctx)){
+							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
+						}
+						ctx->prev_pts = ctx->pts;
+					}
+				}
+
+				write_video(data, clen, ctx->pts, 0, ctx->format_ctx);
+
+				break;
+		}
+		data += clen;
+		len  -= 1 + 4 + 4 + clen;
+	}
+
+	if ( data != ctx->buffer && len > 0){
+		memmove(ctx->buffer, data, len);
+		ctx->buffer_pos = len;
+	} else
+		ctx->buffer_pos = 0;
+
+
+	if (ctx->eos && ctx->format_ctx != NULL){
+		uint8_t* buffer = NULL;
+		int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
+		if (stream_len > 0 && buffer){
+			send_segment(ctx, buffer, stream_len);
+			av_free(buffer);
+		}
+	}
+
+	return 1;
+}
+
+void split_file_and_path(char* access_document, char* config_file, char* stream_name){
+	int t = strlen(access_document) - 1;
+	while(t >= 0 && access_document[t] != '/')
+		--t;
+	strcpy(config_file, access_document);
+
+	if (t >= 0){
+		config_file[t] = 0;
+		strcpy(stream_name, config_file + t + 1);
+	}
+}
+
+
+double get_clock(){
+	struct timeval ts;
+	gettimeofday(&ts, NULL);
+	return ts.tv_sec + (double)(ts.tv_usec) / 1000000.0;
 }
 
 char* get_arg_value(request_rec * r, char* args, char* key){
@@ -251,434 +620,218 @@ char* get_arg_value(request_rec * r, char* args, char* key){
 	return result;
 }
 
-int is_localhost(char* uri){
+static CURLcode curl_post_segment(
+								const char* vb_api_url,
+								const char* version,
+								const char* apikey,
+								const char* password,
+								const char* action,
+								const char* callID,
+								const char* segmentNumber,
+								const char* finalSegment,
+								const char* rtCallbackURL,
+								const char* content_name,
+								const char* content_buff,
+								long content_size,
+								const char* pub,
+								const char* title,
+								const char* time_str,
+								const char* desc,
+								const char* lang,
+								const char* sourceUrl,
+								const char* recordedDate,
+								const char* externalId,
+								const char* ownerId,
+								const char* autoCreate,
+								const char* humanRush,
+								const char* transcriptType,
 
-	int l = strlen(uri);
+								char* status_str,
+								int status_max_size){
+	CURL *curl;
+	CURLcode res;
+	struct curl_httppost *formpost=NULL;
+	struct curl_httppost *lastptr=NULL;
 
-	if (l > 10){
-		if (uri[0] == '/' &&
-			(uri[1] == 'l' || uri[9] == 'L') &&
-			(uri[2] == 'o' || uri[9] == 'O') &&
-			(uri[3] == 'c' || uri[9] == 'C') &&
-			(uri[4] == 'a' || uri[9] == 'A') &&
-			(uri[5] == 'l' || uri[9] == 'L') &&
-			(uri[6] == 'h' || uri[9] == 'H') &&
-			(uri[7] == 'o' || uri[9] == 'O') &&
-			(uri[8] == 's' || uri[9] == 'S') &&
-			(uri[9] == 't' || uri[9] == 'T'))
-			return 1;
+	struct buf_t buf;
+	CURLFORMcode form_res;
+
+	buf.pos = 0;
+	buf.buf = status_str;
+	buf.buf_size = status_max_size;
+//	ast_mutex_lock(&curl_lock);
+
+#define ADD_FORM_DATA(X, VAL) if (VAL) { form_res = curl_formadd(&formpost,  &lastptr,  CURLFORM_COPYNAME, X, CURLFORM_COPYCONTENTS, VAL,  CURLFORM_END); 	}
+
+	ADD_FORM_DATA("version", 		version);
+	ADD_FORM_DATA("apikey", 		apikey);
+	ADD_FORM_DATA("password", 		password);
+	ADD_FORM_DATA("action", 		action);
+	ADD_FORM_DATA("callID", 		callID);
+	ADD_FORM_DATA("startTime", 		time_str);
+	ADD_FORM_DATA("segmentNumber", 	segmentNumber);
+	ADD_FORM_DATA("finalSegment", 	finalSegment);
+	ADD_FORM_DATA("rtCallbackUrl", 	rtCallbackURL);
+	ADD_FORM_DATA("transcriptType", transcriptType);
+	ADD_FORM_DATA("public", 		pub);
+	ADD_FORM_DATA("title", 			title);
+	ADD_FORM_DATA("desc", 			desc);
+	ADD_FORM_DATA("lang", 			lang);
+	ADD_FORM_DATA("sourceUrl", 			sourceUrl);
+	ADD_FORM_DATA("recordedDate", 			recordedDate);
+	ADD_FORM_DATA("externalId", 			externalId);
+	ADD_FORM_DATA("ownerId", 			ownerId);
+	ADD_FORM_DATA("autoCreate", 			autoCreate);
+	ADD_FORM_DATA("humanRush", 			humanRush);
+
+#undef ADD_FORM_DATA
+
+	form_res = curl_formadd(&formpost,
+	               &lastptr,
+	               CURLFORM_COPYNAME, "file",
+	               CURLFORM_BUFFER, 		content_name,
+	               CURLFORM_BUFFERPTR, 		content_buff,
+	               CURLFORM_BUFFERLENGTH, 	content_size,
+	               CURLFORM_END);
+
+//	ast_log(LOG_NOTICE, "content name = %s, content size = %d, content_ptr=0x%X\n", content_name, (int)content_size, (int)content_buff);
+
+
+//	ast_log(LOG_NOTICE, "11 = %d\n", (int)form_res);
+
+
+//	ast_log(LOG_NOTICE, "13 = %d\n", (int)form_res);
+
+	/* get a curl handle */
+	curl = curl_easy_init();
+	if(curl) {
+		/* First set the URL that is about to receive our POST. This URL can
+		   just as well be a https:// URL if that is what should receive the
+		   data. */
+		res = curl_easy_setopt(curl, CURLOPT_URL, vb_api_url);
+	//	ast_log(LOG_NOTICE, "a = %d\n", (int)res);
+		/* Now specify the POST data */
+
+		res = curl_easy_setopt(curl, CURLOPT_HTTPPOST, formpost);
+	//	ast_log(LOG_NOTICE, "b = %d\n", (int)res);
+	//	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1 );
+		res = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, RecvCallBack);
+	//	ast_log(LOG_NOTICE, "c = %d\n", (int)res);
+
+		res = curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+	//	ast_log(LOG_NOTICE, "d = %d\n", (int)res);
+
+		/* Perform the request, res will get the return code */
+		res = curl_easy_perform(curl);
+		/* Check for errors */
+//		if(res != CURLE_OK)
+//			ast_log(LOG_NOTICE, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+
+		if (buf.pos > 0 && buf.pos < buf.buf_size){
+			buf.buf[buf.pos] = 0;
+		} else{
+			buf.buf[0] = 0;
+		}
+
+		curl_formfree(formpost);
+		/* always cleanup */
+		curl_easy_cleanup(curl);
+	}else{
+//	    ast_log(LOG_NOTICE, "Failed to do curl_easy_init()\n");
 	}
-
-	if (l > 10){
-		if (uri[0] == '/' &&
-			(uri[1] == '1') &&
-			(uri[2] == '2') &&
-			(uri[3] == '7') &&
-			(uri[4] == '.') &&
-			(uri[5] == '0') &&
-			(uri[6] == '.') &&
-			(uri[7] == '0') &&
-			(uri[8] == '.') &&
-			(uri[9] == '1'))
-			return 1;
-	}
-
-	return 0;
+//	ast_mutex_unlock(&curl_lock);
+	return res;
 }
 
+/* handle the PUT method */
+static int sc_method_put(request_rec *r)
+{
+    int resource_state;
 
-int process_m3u8(request_rec *r, int lookup_uri, int http){
-    char *filename;
-    int uri_len;
-    char* pure_filename;
-    int i,k;
+    const char *body;
 
-    media_handler_t* 	media;
-    file_source_t*   	source;
-    file_handle_t* 		handle;
-    media_stats_t* 		stats;
-    int 				piece;
-    double start;
-    double stop;
-    double get_data_start;
-    double get_data_stop;
+    int has_range;
+    apr_off_t range_start;
+    apr_off_t range_end;
+    apr_status_t rc;
 
-	int 			stats_size;
-	char* 			stats_buffer;
-	int 			source_size;
-	char* data_source =  NULL;
-	const char *url = NULL;
-	int prefix_len = 0;
+    {
+        apr_bucket_brigade *bb;
+        apr_bucket *b;
+        int seen_eos = 0;
+        int doc_path_len = strlen(ap_context_document_root(r)) + strlen(r->uri) + 1;
+    	char* access_document = apr_palloc(r->pool, doc_path_len);
+    	char* config_file = apr_palloc(r->pool, doc_path_len);
+    	char* stream_name = apr_palloc(r->pool, doc_path_len);
 
+    	//need to get better way to get account info
+    	strcpy(access_document, ap_context_document_root(r));
+    	strcat(access_document, r->uri);
 
-//		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "m3u8 url=%s\n", filename);
+    	split_file_and_path(access_document, config_file, stream_name);
 
-	if (r->header_only) {
-		return OK;
-	}
+     	context_t* ctx =  NULL;
 
-	uri_len = strlen(r->unparsed_uri);
+    	rc = apr_pool_userdata_get((void**)&ctx, access_document,r->connection->pool);
+    	if (rc != APR_SUCCESS || ctx == NULL){
+    		ctx = apr_palloc(r->pool, sizeof(context_t));
+    		context_init(r, config_file, ctx, stream_name);
+    		rc = apr_pool_userdata_set(ctx, access_document, context_close, r->connection->pool);
+    	}
 
-	prefix_len = 0;
+    	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 1 url =%s",  access_document);
 
-	if (http){
-		prefix_len = strlen("http:/");
-	}else{
-		if (get_data_path() == NULL){
-			prefix_len = strlen( r->server->path);
-		}else{
-			prefix_len = strlen( get_data_path() );
-		}
-	}
 
+        bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 2");
+        do {
 
-	filename = apr_pcalloc(r->pool, uri_len + 1 + prefix_len);
 
-	if (http){
-		strcpy(filename, "http:/");
-		strcat(filename, r->unparsed_uri);
-	}else{
-		char* r_unparsed_uri = r->unparsed_uri;
-		if (is_localhost(r->unparsed_uri))
-			r_unparsed_uri += 10;
+            rc = ap_get_brigade(r->input_filters, bb, AP_MODE_READBYTES,
+                                APR_BLOCK_READ, 8000);
+//            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 3");
+            if (rc != APR_SUCCESS) {
 
-		if (get_data_path() == NULL){
-			strcpy(filename, r->server->path);
-			strcat(filename, r_unparsed_uri);
-		}else{
-			strcpy(filename, get_data_path());
-			strcat(filename, r_unparsed_uri);
+                break;
+            }
+//            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 4");
+            for (b = APR_BRIGADE_FIRST(bb);
+                 b != APR_BRIGADE_SENTINEL(bb);
+                 b = APR_BUCKET_NEXT(b))
+            {
+                const char *data;
+                apr_size_t len;
 
-		}
-	}
+                if (APR_BUCKET_IS_EOS(b)) {
+                    seen_eos = 1;
+                    break;
+                }
 
-	uri_len = strlen(filename);
+                if (APR_BUCKET_IS_METADATA(b)) {
+                    continue;
+                }
 
+				rc = apr_bucket_read(b, &data, &len, APR_BLOCK_READ);
 
-	start = get_clock();
+				seen_eos = process_data(r, ctx, (char*)data, len);
 
-	remove_last_extension(filename);//for example we have request for 'test.wav.m3u8' this function cut the last extension ('test.wav') and the file really have to exist
+//				ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: readlen = %d", (int)len);
 
-	data_source = filename;
+				if (rc != APR_SUCCESS) {
+					break;
+				}
 
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: playlist preparation started");
+            }
+ //           ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 5");
+            apr_brigade_cleanup(bb);
+        } while (!seen_eos);
+  //      ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 6");
+        apr_brigade_destroy(bb);
 
-	media  = get_media_handler(data_source);
-	if ( !media ){
-		return DECLINED;
-	}
+    }
 
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: get media handler");
 
-	source_size = get_file_source(r, data_source, NULL, 0);
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: get file source size (%d bytes)", (int) source_size);
-
-	source 	= (file_source_t*)apr_pcalloc(r->pool, source_size);
-	if ( !source )
-		return HTTP_INSUFFICIENT_STORAGE;
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: allocated file source buffer");
-
-	source_size  = get_file_source(r, data_source, source, source_size);
-
-	if ( source_size <= 0 )
-		return HTTP_NOT_ACCEPTABLE;
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: filled file source buffer");
-
-
-	handle 	= (char*)apr_pcalloc(r->pool, source->handler_size);
-	if ( !handle )
-		return HTTP_INSUFFICIENT_STORAGE;
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: allocated file handler buffer");
-
-
-	if ( !source->open(source, handle, data_source, FIRST_ACCESS) ){
-		ap_log_error(APLOG_MARK, APLOG_ERR, get_log_level(), r->server, "HLS: opening data source %s failed", data_source);
-		return DECLINED;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: opened data source %s", data_source);
-
-	get_data_start = get_clock();
-	stats_size 			= media->get_media_stats(handle, source, NULL, 0);
-	stats_buffer		= (char*)apr_pcalloc(r->pool, stats_size);
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: got media stats size %d", stats_size);
-
-	if ( !stats_buffer ){
-		source->close(handle, 0);
-		ap_log_error(APLOG_MARK, APLOG_ERR, get_log_level(), r->server, "HLS: failed to allocate media stats buffer");
-
-		return HTTP_INSUFFICIENT_STORAGE;
-	}
-
-	stats_size 				= media->get_media_stats(handle, source, stats_buffer, stats_size);
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: filled media stats buffer");
-
-	get_data_stop = get_clock();
-
-	pure_filename = get_pure_filename(r,data_source); //get only filename without any directory info
-
-	if (pure_filename){
-		ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: got pure filename %s", pure_filename);
-
-		int playlist_size 		= generate_playlist(stats_buffer, pure_filename, NULL, 0, url);
-		char* playlist_buffer 	= (char*)apr_pcalloc(r->pool, playlist_size);
-
-		if ( !playlist_buffer ){
-			source->close(handle, 0);
-
-			ap_log_error(APLOG_MARK, APLOG_ERR, get_log_level(), r->server, "HLS: failed to allocate playlist buffer (requested size = %d)", (int)playlist_size);
-			return HTTP_INSUFFICIENT_STORAGE;
-		}
-
-		ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: playlist buffer allocated");
-
-
-		playlist_size 			= generate_playlist(stats_buffer, pure_filename, playlist_buffer, playlist_size, url);
-		if (playlist_size <= 0){
-			ap_log_error(APLOG_MARK, APLOG_ERR, get_log_level(), r->server, "HLS: failed to fill playlist buffer");
-
-			source->close(handle, 0);
-			return HTTP_FORBIDDEN;
-		}
-
-		ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: playlist generated successfully");
-
-
-		ap_set_content_type(r, "audio/x-mpegurl");
-
-		ap_set_content_length(r, playlist_size);
-		ap_rwrite( playlist_buffer, playlist_size, r);
-
-		ap_finalize_request_protocol(r);
-
-		ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: sent content to client");
-
-	}
-
-	source->close(handle, 0);
-
-	stop = get_clock();
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: data source closed");
-
-	return DONE;
-}
-
-int process_ts(request_rec *r, int lookup_uri, int http){
-    char *filename;
-    int uri_len;
-    char* pure_filename;
-    int i,k;
-
-    media_handler_t* 	media;
-    file_source_t*   	source;
-    file_handle_t* 		handle;
-    media_stats_t* 		stats;
-    int 				piece;
-    double start;
-    double stop;
-    double get_data_start;
-    double get_data_stop;
-	int 			stats_size;
-	media_stats_t* 	stats_buffer;
-	int 			data_size;
-	media_data_t* 	data_buffer;
-	int 			muxed_size;
-	char* 			muxed_buffer;
-	int 			source_size;
-	char* 			url;
-	char* data_source;
-	int prefix_len;
-
-	if (r->header_only) {
-		return OK;
-	}
-
-	uri_len= strlen(r->unparsed_uri);
-	prefix_len = 0;
-
-	if (http){
-		prefix_len = strlen("http:/");
-	}else{
-		if (get_data_path() == NULL){
-			prefix_len = strlen( r->server->path);
-		}else{
-			prefix_len = strlen( get_data_path() );
-		}
-	}
-
-
-	filename = apr_pcalloc(r->pool, uri_len + 1 + prefix_len);
-
-	if (http){
-		strcpy(filename, "http:/");
-		strcat(filename, r->unparsed_uri);
-	}else{
-		char* r_unparsed_uri = r->unparsed_uri;
-		if (is_localhost(r->unparsed_uri))
-			r_unparsed_uri += 10;
-
-		if (get_data_path() == NULL){
-			strcpy(filename, r->server->path);
-			strcat(filename, r_unparsed_uri);
-		}else{
-			strcpy(filename, get_data_path());
-			strcat(filename, r_unparsed_uri);
-
-		}
-	}
-
-	uri_len = strlen(filename);
-
-	start = get_clock();
-
-	piece = get_real_filename(filename);
-
-	data_source = filename;
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: segment preparation started");
-
-	media  = get_media_handler(data_source);
-	if ( !media )
-		return HTTP_NOT_ACCEPTABLE;
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: got media handler");
-
-	source_size = get_file_source(r, data_source, NULL, 0);
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: data source requires %d bytes", (int)source_size);
-
-	source 	= (file_source_t*)apr_pcalloc(r->pool, source_size);
-	if ( !source )
-		return HTTP_INSUFFICIENT_STORAGE;
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: data source allocated");
-
-	source_size  = get_file_source(r, data_source, source, source_size);
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: data source filled");
-
-	if ( source_size <= 0 )
-		return HTTP_NOT_ACCEPTABLE;
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: file handler requires %d bytes", (int)source->handler_size);
-
-	handle 	= (char*)apr_pcalloc(r->pool, source->handler_size);
-	if ( !handle )
-		return HTTP_INSUFFICIENT_STORAGE;
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: file handler allocated");
-
-	if ( !source->open(source, handle, data_source, 0) ){
-		ap_log_error(APLOG_MARK, APLOG_ERR, get_log_level(), r->server, "HLS: failed to open file %s", data_source);
-		return HTTP_NOT_FOUND;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: file opened");
-
-	stats_size 			= media->get_media_stats(handle, source, NULL, 0);
-	if ( stats_size <= 0){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to get media stats size");
-		source->close(handle, 0);
-		return HTTP_MOVED_PERMANENTLY;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: got media stats size");
-
-	stats_buffer		= (char*)apr_pcalloc(r->pool, stats_size);
-	if ( !stats_buffer ){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to alloc media stats buffer (%d bytes requested)", (int)stats_size);
-		source->close(handle, 0);
-		return HTTP_INSUFFICIENT_STORAGE;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: allocated space for media stats");
-
-
-	stats_size 				= media->get_media_stats(handle, source, stats_buffer, stats_size);
-	if ( stats_size <= 0){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to get media stats data");
-		source->close(handle, 0);
-		return HTTP_MOVED_PERMANENTLY;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: got media stats data");
-
-	data_size 			= media->get_media_data(handle, source, stats_buffer, piece, NULL, 0);
-	if (data_size <= 0){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to get media data size");
-		source->close(handle, 0);
-		return HTTP_MOVED_PERMANENTLY;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: got media data size");
-
-
-	data_buffer 		= (media_data_t*)apr_pcalloc(r->pool, data_size);
-	if ( !data_buffer ){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to alloc media data (requested size %d bytes)", (int) data_size);
-		source->close(handle, 0);
-		return HTTP_INSUFFICIENT_STORAGE;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: allocated media data buffer");
-
-	get_data_start = get_clock();
-	data_size 			= media->get_media_data(handle, source, stats_buffer, piece, data_buffer, data_size);
-	if (data_size <= 0){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to get media data");
-		source->close(handle, 0);
-		return HTTP_MOVED_PERMANENTLY;
-	}
-	get_data_stop = get_clock();
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: fill media data buffer");
-
-
-	muxed_size = mux_to_ts(stats_buffer, data_buffer, NULL, 0);
-	if ( muxed_size <= 0 ){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to get multiplex size");
-		source->close(handle, 0);
-		return HTTP_EXPECTATION_FAILED;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: got multiplex size");
-
-	muxed_buffer = (char*)apr_pcalloc(r->pool, muxed_size);
-	if ( !muxed_buffer ){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to alloc multiplex buffer (requested size %d bytes)", (int)muxed_size);
-		source->close(handle, 0);
-		return HTTP_INSUFFICIENT_STORAGE;
-	}
-
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: allocate multiplex buffer");
-
-	muxed_size = mux_to_ts(stats_buffer, data_buffer, muxed_buffer, muxed_size);
-	if ( muxed_size <= 0 ){
-		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "HLS: failed to fill multiplex buffer");
-		source->close(handle, 0);
-		return HTTP_EXPECTATION_FAILED;
-	}
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: filled multiplex buffer");
-
-	ap_set_content_type(r, "video/mp2t");
-	ap_set_content_length(r, muxed_size);
-	ap_rwrite( muxed_buffer, muxed_size, r);
-	ap_finalize_request_protocol(r);
-
-	source->close(handle, 0);
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: data source closed");
-
-	stop = get_clock();
-
-//		ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "time required to send .ts responce = %lf, get data takes %lf", (stop - start), (get_data_stop - get_data_start));
-
-	return DONE;
+    return OK;
 }
 /*--------------------------------------------------------------------------*/
 /*                                                                          */
@@ -704,83 +857,23 @@ int process_ts(request_rec *r, int lookup_uri, int http){
  *  DECLINED ("this isn't something with which we want to get involved")
  *  HTTP_mumble ("an error status should be reported")
  */
-static int hls_quick_handler(request_rec *r, int lookup_uri)
+int sc_handler(request_rec *r, int lookup_uri)
 {
-    char *filename;
-    int uri_len;
-    char* pure_filename;
-    int i,k;
 
-    media_handler_t* 	media;
-    file_source_t*   	source;
-    file_handle_t* 		handle;
-    media_stats_t* 		stats;
-    int 				piece;
-    double start;
-    double stop;
-    double get_data_start;
-    double get_data_stop;
+	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Handler start");
 
+	r->allowed = 0
+		| (AP_METHOD_BIT << M_PUT)
+		| (AP_METHOD_BIT << M_POST);
 
-    int use_http = get_allow_http() && (!is_localhost(r->unparsed_uri));
-    
-    uri_len= strlen(r->unparsed_uri);
+	 if (r->method_number == M_PUT || r->method_number == M_POST) {
 
-    if ( !(use_http) && is_localhost(r->unparsed_uri) ) {
-	int prefix_len = 0;
-	char* r_unparsed_uri = r->unparsed_uri;
-	r_unparsed_uri += 10;
-
-	if (get_data_path() == NULL){
-		prefix_len = strlen( r->server->path);
-	} else{
-		prefix_len = strlen( get_data_path() );
-	}
-
-	filename = apr_pcalloc(r->pool, uri_len + 1 + prefix_len);
-	
-	if (get_data_path() == NULL){
-		strcpy(filename, r->server->path);
-		strcat(filename, r_unparsed_uri);
-	}else{
-		strcpy(filename, get_data_path());
-		strcat(filename, r_unparsed_uri);
-	}
-
-    	int path_len;
-	path_len = strlen(filename);
-
-        if (path_len > 4 && filename[path_len-3] == '.' && filename[path_len-2] == 't' && filename[path_len-1] == 's') {
-		prefix_len = get_real_filename(filename);
-	} else {
-		remove_last_extension(filename);
-   	}
-	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: check local file : %s", filename);
-       FILE *file;
-       if (!(file = fopen(filename, "r"))) {
-         use_http = 1;
-       } else {
-         fclose(file);
-       }
-   }
-
-   	ap_log_error(APLOG_MARK, APLOG_WARNING, get_log_level(), r->server, "HLS: unparsed uri %s, use http=%d", r->unparsed_uri, (int)use_http);
-
-
-   filename = r->unparsed_uri;
-
-    if (uri_len > 4 && filename[uri_len-3] == '.' && filename[uri_len-2] == 't' && filename[uri_len-1] == 's') {
-    	return process_ts(r, lookup_uri, use_http);
-    }
-
-	if (uri_len > 5 && filename[uri_len-5] == '.' && filename[uri_len-4] == 'm' && filename[uri_len-3] == '3'
-												  && filename[uri_len-2] == 'u' && filename[uri_len-1] == '8') {
-		return process_m3u8(r, lookup_uri, use_http);
+		return sc_method_put(r);
 	}
 
     return DECLINED;
 }
-void set_server_pool(apr_pool_t* p);
+
 
 /*--------------------------------------------------------------------------*/
 /*                                                                          */
@@ -814,82 +907,75 @@ void set_server_pool(apr_pool_t* p);
  * The actual delivery of content to the browser [9] is not handled by
  * a hook; see the handler declarations below.
  */
-static void hls_register_hooks(apr_pool_t *p)
+
+
+static void sc_register_hooks(apr_pool_t *p)
 {
-	set_allow_wav(1);
-	set_allow_mp3(1);
-	set_allow_http(1);
-	set_encode_audio_bitrate(128000);
-	set_encode_audio_codec(1);
-	set_logo_filename(NULL);
-	set_segment_length(10);
-	set_allow_redirect(0);
+//    ap_hook_handler(sc_handler, NULL, NULL, APR_HOOK_MIDDLE);
+//	ap_register_input_filter(sc_filter_name, sc_filter, NULL, AP_FTYPE_CONTENT_SET);
+//	ap_register_output_filter(sc_filter_name, sc_filter_out, NULL, AP_FTYPE_CONTENT_SET);
 
-	set_server_pool(p);
-	set_log_level(9);
-
-	set_data_path(NULL);
-
-    ap_hook_quick_handler(hls_quick_handler, NULL, NULL, APR_HOOK_MIDDLE);
+	av_register_all();
+	ap_hook_quick_handler(sc_handler, NULL, NULL, APR_HOOK_LAST);
 }
 
 const char* hls_option_audio_encoding_bitrate(cmd_parms *cmd, void *cfg, const char *arg){
-	set_encode_audio_bitrate(atoi(arg));
+	//set_encode_audio_bitrate(atoi(arg));
 
 	return NULL;
 }
 
 const char* hls_option_audio_encoding_codec(cmd_parms *cmd, void *cfg, const char *arg){
-	if(!strcasecmp(arg, "mp3")){
-		set_encode_audio_codec(1);
-	}
-	set_encode_audio_codec(1);
+//	if(!strcasecmp(arg, "mp3")){
+//		set_encode_audio_codec(1);
+//	}
+//	set_encode_audio_codec(1);
 
 	return NULL;
 }
 
 const char* hls_option_logo_filename(cmd_parms *cmd, void *cfg, const char *arg){
-	set_logo_filename(arg);
+//	set_logo_filename(arg);
 	return NULL;
 }
 
 const char* hls_option_allow_http(cmd_parms *cmd, void *cfg, const char *arg){
-	if(!strcasecmp(arg, "yes")) set_allow_http(1);
-	    else set_allow_http(0);
+//	if(!strcasecmp(arg, "yes")) set_allow_http(1);
+//	    else set_allow_http(0);
 	return NULL;
 }
 
 const char* hls_option_allow_redirect(cmd_parms *cmd, void *cfg, const char *arg){
-	if(!strcasecmp(arg, "yes")) set_allow_redirect(1);
-	    else set_allow_redirect(0);
+//	if(!strcasecmp(arg, "yes")) set_allow_redirect(1);
+//	    else set_allow_redirect(0);
 	return NULL;
 }
 
 
 const char* hls_option_allow_wav(cmd_parms *cmd, void *cfg, const char *arg){
-	if(!strcasecmp(arg, "yes")) set_allow_wav(1);
-	    else set_allow_wav(0);
+//	if(!strcasecmp(arg, "yes")) set_allow_wav(1);
+//	    else set_allow_wav(0);
 	return NULL;
 }
 
 const char* hls_option_allow_mp3(cmd_parms *cmd, void *cfg, const char *arg){
-	if(!strcasecmp(arg, "yes")) set_allow_mp3(1);
-	    else set_allow_mp3(0);
+//	if(!strcasecmp(arg, "yes")) set_allow_mp3(1);
+//	    else set_allow_mp3(0);
 	return NULL;
 }
 
 const char* hls_option_data_path(cmd_parms *cmd, void *cfg, const char *arg){
-	set_data_path(arg);
+//	set_data_path(arg);
 	return NULL;
 }
 
 const char* hls_option_segment_length(cmd_parms *cmd, void *cfg, const char *arg){
-	set_segment_length(atoi(arg));
+//	set_segment_length(atoi(arg));
 	return NULL;
 }
 
 const char* hls_option_log_level(cmd_parms *cmd, void *cfg, const char *arg){
-	set_log_level(atoi(arg));
+//	set_log_level(atoi(arg));
 	return NULL;
 }
 
@@ -905,18 +991,18 @@ const char* hls_option_log_level(cmd_parms *cmd, void *cfg, const char *arg){
 /*
  * List of directives specific to our module.
  */
-static const command_rec hls_cmds[] =
+static const command_rec sc_cmds[] =
 {
-	AP_INIT_TAKE1(  "AudioEncodingBitrate", hls_option_audio_encoding_bitrate, NULL, OR_OPTIONS, "Audio bitrate for internal audio encoder (in kbps)" ),
-	AP_INIT_TAKE1(  "AudioEncodingCodec",   hls_option_audio_encoding_codec,   NULL, OR_OPTIONS, "Audio codec used for internal encoding. Currently support only one codec 1 - mp3" ),
-	AP_INIT_TAKE1(  "LogoFilename",         hls_option_logo_filename,  		   NULL, OR_OPTIONS, "H264 Video file in AnnexB form" ),
-	AP_INIT_TAKE1(  "AllowWAV", 			hls_option_allow_wav, 		  	   NULL, OR_OPTIONS, "Allow WAV files to process" ),
-	AP_INIT_TAKE1(  "AllowMP3", 			hls_option_allow_mp3, 		  	   NULL, OR_OPTIONS, "Allow MP3 files to process" ),
-	AP_INIT_TAKE1(  "AllowHTTP", 			hls_option_allow_http, 		  	   NULL, OR_OPTIONS, "Allow HTTP routing" ),
-	AP_INIT_TAKE1(  "SegmentLength", 		hls_option_segment_length, 	 	   NULL, OR_OPTIONS, "Segment length in seconds" ),
-	AP_INIT_TAKE1(  "AllowRedirect", 		hls_option_allow_redirect, 	 	   NULL, OR_OPTIONS, "Allow redirect for HTTP request to remote content" ),
-	AP_INIT_TAKE1(  "HLSLogLevel", 			hls_option_log_level, 		 	   NULL, OR_OPTIONS, "Setup log level for HLS plugin" ),
-	AP_INIT_TAKE1(  "HLSDataPath", 			hls_option_data_path, 		 	   NULL, OR_OPTIONS, "Data path for HLS plugin" ),
+//	AP_INIT_TAKE1(  "AudioEncodingBitrate", hls_option_audio_encoding_bitrate, NULL, OR_OPTIONS, "Audio bitrate for internal audio encoder (in kbps)" ),
+//	AP_INIT_TAKE1(  "AudioEncodingCodec",   hls_option_audio_encoding_codec,   NULL, OR_OPTIONS, "Audio codec used for internal encoding. Currently support only one codec 1 - mp3" ),
+//	AP_INIT_TAKE1(  "LogoFilename",         hls_option_logo_filename,  		   NULL, OR_OPTIONS, "H264 Video file in AnnexB form" ),
+//	AP_INIT_TAKE1(  "AllowWAV", 			hls_option_allow_wav, 		  	   NULL, OR_OPTIONS, "Allow WAV files to process" ),
+//	AP_INIT_TAKE1(  "AllowMP3", 			hls_option_allow_mp3, 		  	   NULL, OR_OPTIONS, "Allow MP3 files to process" ),
+//	AP_INIT_TAKE1(  "AllowHTTP", 			hls_option_allow_http, 		  	   NULL, OR_OPTIONS, "Allow HTTP routing" ),
+//	AP_INIT_TAKE1(  "SegmentLength", 		hls_option_segment_length, 	 	   NULL, OR_OPTIONS, "Segment length in seconds" ),
+//	AP_INIT_TAKE1(  "AllowRedirect", 		hls_option_allow_redirect, 	 	   NULL, OR_OPTIONS, "Allow redirect for HTTP request to remote content" ),
+//	AP_INIT_TAKE1(  "HLSLogLevel", 			hls_option_log_level, 		 	   NULL, OR_OPTIONS, "Setup log level for HLS plugin" ),
+//	AP_INIT_TAKE1(  "HLSDataPath", 			hls_option_data_path, 		 	   NULL, OR_OPTIONS, "Data path for HLS plugin" ),
 
 
     {NULL}
@@ -931,13 +1017,13 @@ static const command_rec hls_cmds[] =
  * Module definition for configuration.  If a particular callback is not
  * needed, replace its routine name below with the word NULL.
  */
-module AP_MODULE_DECLARE_DATA hls_module =
+module AP_MODULE_DECLARE_DATA sc_module =
 {
     STANDARD20_MODULE_STUFF,
     NULL,    /* per-directory config creator */
     NULL,     /* dir config merger */
     NULL, /* server config creator */
     NULL,  /* server config merger */
-    hls_cmds,                 /* command table */
-    hls_register_hooks,       /* set up other request processing hooks */
+    sc_cmds,                 /* command table */
+    sc_register_hooks,       /* set up other request processing hooks */
 };

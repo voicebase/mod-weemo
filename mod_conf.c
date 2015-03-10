@@ -115,9 +115,9 @@ char* get_data_path(){
 }
 
 void set_data_path(char* path){
-	if (path == NULL)
-		config.data_path[0] = 0;
-	else
-		strncpy(config.data_path, path, sizeof(config.data_path));
+//	if (path == NULL)
+//		config.data_path[0] = 0;
+//	else
+//		strncpy(config.data_path, path, sizeof(config.data_path));
 
 }
