@@ -63,6 +63,7 @@ typedef struct context_t{
 	int 	segment_duration; //in milliseconds
 	char* 	stream_name;
 	int 	eos;
+	int 	n_iframes;
 	AVFormatContext* format_ctx;
 } context_t;
 
@@ -233,6 +234,7 @@ int context_init(request_rec* r, char* config, struct context_t* ctx, char* stre
 	ctx->segment_duration = 120000;
 	ctx->segment		= 0;
 	ctx->eos			= 0;
+	ctx->n_iframes		= 0;
 	ctx->cfg 			= load_config(r, config);
 	ctx->buffer_size 	= get_safe_integer(ctx->cfg, "BufferSize", 1000000);
 	ctx->buffer 		= apr_palloc(r->connection->pool, ctx->buffer_size);
@@ -511,8 +513,9 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 				break;
 			case 0x80://audio
 				//move_to_file(fin,fout, len);
-
-				write_audio(data, clen, ctx->pts, 1, ctx->format_ctx);
+				if (ctx->n_iframes > 0){
+					write_audio(data, clen, ctx->pts, 1, ctx->format_ctx);
+				}
 				ctx->pts += 20;
 				break;
 			case 0x90://video
@@ -520,6 +523,7 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 				if (data[0] & 0x01 == 0){ //I frame
 					if (ctx->pts - ctx->prev_pts > ctx->segment_duration){
 						uint8_t* buffer = NULL;
+						ctx->n_iframes = 0;
 						int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
 
 						if (stream_len > 0 && buffer){
@@ -532,9 +536,12 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 						}
 						ctx->prev_pts = ctx->pts;
 					}
+					++ctx->n_iframes;
 				}
 
-				write_video(data, clen, ctx->pts, 0, ctx->format_ctx);
+				if (ctx->n_iframes > 0){
+					write_video(data, clen, ctx->pts, 0, ctx->format_ctx);
+				}
 
 				break;
 		}
