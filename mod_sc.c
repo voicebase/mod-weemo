@@ -64,6 +64,8 @@ typedef struct context_t{
 	char* 	stream_name;
 	int 	eos;
 	int 	n_iframes;
+	char* 	cfg_data;
+	int 	no_video;
 	AVFormatContext* format_ctx;
 } context_t;
 
@@ -126,12 +128,19 @@ int check_exist(request_rec *r, const char* filename){
 	return -1;
 }
 
-
-cJSON* load_config(request_rec* r, char* config_file){
-	int config_file_size = check_exist(r, config_file);
+cJSON* load_config( request_rec* r, context_t* ctx, char* config_file){
+	int config_file_size = check_exist(r,  config_file);
 	if (config_file_size > 0){
-		char* data = apr_palloc(r->pool, config_file_size);
-		cJSON* res = cJSON_Parse(data);
+		ctx->cfg_data = apr_palloc(r->pool, config_file_size);
+		apr_file_t* f = NULL;
+		apr_file_open (&f, config_file, APR_READ, APR_OS_DEFAULT, r->pool);
+
+		if (f){
+			apr_size_t nbytes = config_file_size;
+			apr_file_read(f, ctx->cfg_data, &nbytes);
+			apr_file_close(f);
+		}
+		cJSON* res = cJSON_Parse(ctx->cfg_data );
 		return res;
 	}
 	return NULL;
@@ -157,11 +166,20 @@ const char* get_safe_string(cJSON* obj, char* name, char* default_val){
 	return default_val;
 }
 
-const char *get_time(){
-	return "00:00:00";
+
+
+
+char time_buffer[16];
+const char *get_time(int pts){
+
+	int hours = pts / (60*60*1000);
+	int mins = (pts - hours * 60 *60 * 1000)/ (60 * 1000);
+	int secs = (pts - hours * 60 *60* 1000 - mins * 60 * 1000) / 1000;
+	sprintf(time_buffer, "%02d:%02d:%02d.%03d", hours, mins, secs, pts % 1000);
+	return time_buffer;
 }
 
-int send_segment(struct context_t* ctx, char* data, int len){
+int send_segment(request_rec* r, struct context_t* ctx, char* data, int len){
 	char segmentNumber[12];
 	char status_str[1024];
 	char content_name[1024];
@@ -173,7 +191,7 @@ int send_segment(struct context_t* ctx, char* data, int len){
 	const char* pub 			= get_safe_string(ctx->cfg, "public", NULL);
 	const char* rtCallbackURL   = get_safe_string(ctx->cfg, "rtCallBackURL", NULL);
 	const char* transcriptType  = get_safe_string(ctx->cfg, "transcriptType", "machine");
-	const char* time_str 		= get_time();
+	const char* time_str 		= get_time(ctx->prev_pts);
 	const char* desc 		 	= get_safe_string(ctx->cfg, "description", NULL);
 	const char* lang 		 	= get_safe_string(ctx->cfg, "language", NULL);
 	const char* sourceUrl 	 	= get_safe_string(ctx->cfg, "sourceURL", NULL);
@@ -188,8 +206,9 @@ int send_segment(struct context_t* ctx, char* data, int len){
 
 	snprintf(content_name, sizeof(content_name), "%s.webm", ctx->stream_name);
 
-	if (vb_api_url && version && apikey && password && pub && rtCallbackURL && transcriptType &&
-			time_str && desc && lang && sourceUrl && recordedDate && externalId && ownerId	&&  autoCreate && humanRush)
+//	fprintf(stderr, "uploadMedia=%s content_name=%s data_len=%d\n", ctx->stream_name, content_name, len);
+
+	if (vb_api_url && version && apikey && password )
 	{
 		if (curl_post_segment( vb_api_url,
 							"1.1",
@@ -198,11 +217,11 @@ int send_segment(struct context_t* ctx, char* data, int len){
 							"uploadMedia",
 							ctx->stream_name,//			const char* callID,
 							segmentNumber,
-							len == 0 ? "true" : "false",// 			const char* finalSegment,
+							ctx->eos ? "true" : "false",// 			const char* finalSegment,
 							rtCallbackURL,
 							content_name,
-							ctx->buffer,
-							ctx->buffer_size,
+							data,
+							len,
 							pub,
 							ctx->stream_name,
 							time_str,
@@ -217,6 +236,9 @@ int send_segment(struct context_t* ctx, char* data, int len){
 							transcriptType,
 							status_str,
 							sizeof(status_str)) ==  CURLE_OK){
+			if (r){
+				ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Post segment %d, eos= %d, status=%s\n", ctx->segment, ctx->eos, status_str);
+			}
 			++ctx->segment;
 		}else{
 	//		printf error;
@@ -225,8 +247,8 @@ int send_segment(struct context_t* ctx, char* data, int len){
 	//	printf error
 	}
 }
-
 int context_init(request_rec* r, char* config, struct context_t* ctx, char* stream_name){
+
 	ctx->buffer_pos 	= 0;
 	ctx->sent 			= 0;
 	ctx->pts 			= 0;
@@ -235,22 +257,30 @@ int context_init(request_rec* r, char* config, struct context_t* ctx, char* stre
 	ctx->segment		= 0;
 	ctx->eos			= 0;
 	ctx->n_iframes		= 0;
-	ctx->cfg 			= load_config(r, config);
+	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Open configuration file %s", config);
+	ctx->cfg 			= load_config(r, ctx, config);
 	ctx->buffer_size 	= get_safe_integer(ctx->cfg, "BufferSize", 1000000);
 	ctx->buffer 		= apr_palloc(r->connection->pool, ctx->buffer_size);
 	ctx->stream_name	= apr_palloc(r->connection->pool, strlen(stream_name)+1);
+	ctx->no_video		= strcasecmp(get_safe_string(ctx->cfg, "noVideo", "false"), "true") == 0;
 	strcpy(ctx->stream_name, stream_name);
 	return 0;
 }
+
+
 
 apr_status_t context_close(void* ctx){
 
 	struct context_t* context = (context_t*)ctx;
 
-	send_segment(context, NULL, 0);
-	if (context->cfg){
-		cJSON_Delete(context->cfg);
-		context->cfg = NULL;
+	if (context->eos == 0){
+		context->eos = 1;
+
+		send_segment(NULL, context, NULL, 0);
+		if (context->cfg){
+			cJSON_Delete(context->cfg);
+			context->cfg = NULL;
+		}
 	}
 
 	return APR_SUCCESS;
@@ -274,8 +304,8 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id, 
 
 	/* put sample parameters */
 	c->bit_rate 		= bitrate;
-	c->pkt_timebase.num = 1;
-	c->pkt_timebase.den = fps;
+//	c->pkt_timebase.num = 1;
+//	c->pkt_timebase.den = fps;
 
 
 	/* resolution must be a multiple of two */
@@ -337,14 +367,15 @@ static AVStream *add_audio_stream(AVFormatContext *oc, enum AVCodecID codec_id, 
 
 	/* put sample parameters */
 	c->bit_rate 	= bitrate;
-	c->pkt_timebase.num = 1;
-	c->pkt_timebase.den = sample_rate;
+//	c->pkt_timebase.num = 1;
+//	c->pkt_timebase.den = sample_rate;
 
 	/* time base: this is the fundamental unit of time (in seconds) in terms
 	of which frame timestamps are represented. for fixed-fps content,
 	timebase should be 1/framerate and timestamp increments should be
 	identically 1. */
-	c->time_base = c->pkt_timebase;
+	c->time_base.num = 1;// = c->pkt_timebase;
+	c->time_base.den = sample_rate;
 
 	c->sample_fmt  =  AV_SAMPLE_FMT_FLTP;
 	c->sample_rate = sample_rate;
@@ -354,7 +385,7 @@ static AVStream *add_audio_stream(AVFormatContext *oc, enum AVCodecID codec_id, 
 	c->extradata_size = 0;
 
 	st->start_time		= 0;
-	st->time_base		= c->pkt_timebase;
+	st->time_base		= c->time_base;
 	st->cur_dts 		= 0;
 
 	// some formats want stream headers to be separate
@@ -384,12 +415,12 @@ int CloseOutputContainer(AVFormatContext* OutFmtCtx, uint8_t **buffer){
 	return 0;
 }
 
-int CreateOutputContainer(AVFormatContext** OutFmtCtx){
+int CreateOutputContainer(AVFormatContext** OutFmtCtx, int no_video){
 	AVOutputFormat *fmt;
 	AVFormatContext *oc;
 
 	char* out_format_name = NULL;
-	out_format_name = "webm";
+	out_format_name = "matroska";
 	if (out_format_name){
 		fmt = av_guess_format(out_format_name, NULL, NULL);
 		if (!fmt) {
@@ -415,7 +446,10 @@ int CreateOutputContainer(AVFormatContext** OutFmtCtx){
 //	snprintf(oc->filename, sizeof(oc->filename), "%s", filename);
 	oc->filename[0] =0;
 /* add the audio and video streams using the default format codecs and initialize the codecs */
-	AVStream* video_st = add_video_stream(oc, AV_CODEC_ID_VP8, 400000, 640, 360, 25, 12, AV_PIX_FMT_YUV420P,  0,0, 400000);
+
+	if (!no_video){
+		AVStream* video_st = add_video_stream(oc, AV_CODEC_ID_VP8, 400000, 640, 360, 25, 12, AV_PIX_FMT_YUV420P,  0,0, 400000);
+	}
 	AVStream* audio_st = add_audio_stream(oc, AV_CODEC_ID_OPUS, 64000, 48000, 1);
 
 	//fmt->flags |= AVFMT_TS_NONSTRICT;
@@ -473,8 +507,9 @@ void write_audio(uint8_t* buffer, int len, int pts, int stream_index, AVFormatCo
 
 int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 
+//	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Process data 1");
 	if (!ctx->format_ctx){
-		 if (!CreateOutputContainer(&ctx->format_ctx)){
+		 if (!CreateOutputContainer(&ctx->format_ctx, ctx->no_video)){
 		    	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
 		 }
 	}
@@ -484,7 +519,7 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 
 		data = &ctx->buffer[0];
 		len  = ctx->buffer_pos;
-
+//		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: len=%d", len);
 	}
 
 
@@ -492,12 +527,12 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 		if (len < 1 + 4 + 4){
 			break;
 		}
-		unsigned int type = data[0];
+		unsigned int type = (unsigned char)data[0];
 		unsigned int index = ((unsigned int*)&data[1])[0];
 		unsigned int clen = ((unsigned int*)&data[1+4])[0];
 
-//			fprintf(stderr, "type= %d, index=%d, len = %d\n", type, index, len);
-		if ( len + 1 + 4 + 4 < clen){
+//		fprintf(stderr, "type= %d, index=%d, len = %d\n", type, index, len);
+		if ( len  < clen + 1 + 4 + 4){
 			break;
 		}
 
@@ -506,40 +541,73 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 		switch(type){
 			case 0x00://control;
 				{
-					int cc = data[0];
-					if (cc == 0xFF)
+					unsigned int cc = (unsigned char)data[0];
+					if (cc == 0xFF){
+						ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: found end of stream");
 						ctx->eos = 1;
+					}
 				}
 				break;
 			case 0x80://audio
 				//move_to_file(fin,fout, len);
-				if (ctx->n_iframes > 0){
-					write_audio(data, clen, ctx->pts, 1, ctx->format_ctx);
-				}
-				ctx->pts += 20;
-				break;
-			case 0x90://video
-
-				if (data[0] & 0x01 == 0){ //I frame
+			//	fread(audio_buffer, 1, len, fin);
+//				ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: audio=%d", clen);
+				if (ctx->no_video){
 					if (ctx->pts - ctx->prev_pts > ctx->segment_duration){
-						uint8_t* buffer = NULL;
+						char* buffer = NULL;
 						ctx->n_iframes = 0;
 						int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
 
 						if (stream_len > 0 && buffer){
-							send_segment(ctx, buffer, stream_len);
+							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment size(non final) %d", stream_len);
+
+							send_segment(r, ctx, buffer, stream_len);
+
 							av_free(buffer);
 						}
+
 						ctx->format_ctx = NULL;
-						if (!CreateOutputContainer(&ctx->format_ctx)){
-							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
+						if (!CreateOutputContainer(&ctx->format_ctx, ctx->no_video)){
+//								ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
+						}
+						ctx->prev_pts = ctx->pts;
+					}
+				}
+				if (ctx->n_iframes > 0 || ctx->no_video){
+					write_audio(data, clen, ctx->pts, ctx->no_video ? 0 : 1, ctx->format_ctx);
+				}
+
+				ctx->pts += 20;
+//				ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: pts %d", ctx->pts);
+				if (ctx->n_iframes == 0 && !ctx->no_video)
+					ctx->prev_pts = ctx->pts;
+
+				break;
+			case 0x90://video
+//				ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: video=%d", clen);
+				if ((data[0] & 0x01) == 0){ //I frame
+					if (ctx->pts - ctx->prev_pts > ctx->segment_duration){
+						char* buffer = NULL;
+						ctx->n_iframes = 0;
+						int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
+
+						if (stream_len > 0 && buffer){
+							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment size(non final) %d", stream_len);
+							send_segment(r, ctx, buffer, stream_len);
+
+							av_free(buffer);
+						}
+
+						ctx->format_ctx = NULL;
+						if (!CreateOutputContainer(&ctx->format_ctx, ctx->no_video)){
+//								ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
 						}
 						ctx->prev_pts = ctx->pts;
 					}
 					++ctx->n_iframes;
 				}
 
-				if (ctx->n_iframes > 0){
+				if (ctx->n_iframes > 0 && ! ctx->no_video){
 					write_video(data, clen, ctx->pts, 0, ctx->format_ctx);
 				}
 
@@ -560,12 +628,17 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 		uint8_t* buffer = NULL;
 		int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
 		if (stream_len > 0 && buffer){
-			send_segment(ctx, buffer, stream_len);
+			ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment size %d", stream_len);
+
+			send_segment(r, ctx, buffer, stream_len);
 			av_free(buffer);
 		}
 	}
 
-	return 1;
+	if (ctx && ctx->eos)
+		return APR_OS_START_USERERR;
+
+	return APR_SUCCESS;
 }
 
 void split_file_and_path(char* access_document, char* config_file, char* stream_name){
@@ -627,7 +700,7 @@ char* get_arg_value(request_rec * r, char* args, char* key){
 	return result;
 }
 
-static CURLcode curl_post_segment(
+CURLcode curl_post_segment(
 								const char* vb_api_url,
 								const char* version,
 								const char* apikey,
@@ -740,6 +813,9 @@ static CURLcode curl_post_segment(
 			buf.buf[0] = 0;
 		}
 
+//		fprintf(stderr, "%s\n", buf.buf);
+
+
 		curl_formfree(formpost);
 		/* always cleanup */
 		curl_easy_cleanup(curl);
@@ -749,6 +825,7 @@ static CURLcode curl_post_segment(
 //	ast_mutex_unlock(&curl_lock);
 	return res;
 }
+
 
 /* handle the PUT method */
 static int sc_method_put(request_rec *r)
@@ -779,6 +856,8 @@ static int sc_method_put(request_rec *r)
 
      	context_t* ctx =  NULL;
 
+//    	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "A");
+
     	rc = apr_pool_userdata_get((void**)&ctx, access_document,r->connection->pool);
     	if (rc != APR_SUCCESS || ctx == NULL){
     		ctx = apr_palloc(r->pool, sizeof(context_t));
@@ -786,11 +865,12 @@ static int sc_method_put(request_rec *r)
     		rc = apr_pool_userdata_set(ctx, access_document, context_close, r->connection->pool);
     	}
 
-    	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 1 url =%s",  access_document);
+   // 	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 1 url =%s",  access_document);
+  //  	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "B");
 
 
         bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 2");
+    //    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: 2");
         do {
 
 
@@ -817,6 +897,7 @@ static int sc_method_put(request_rec *r)
                 if (APR_BUCKET_IS_METADATA(b)) {
                     continue;
                 }
+//            	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "C");
 
 				rc = apr_bucket_read(b, &data, &len, APR_BLOCK_READ);
 
