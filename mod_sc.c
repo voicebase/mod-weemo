@@ -255,7 +255,7 @@ int context_init(request_rec* r, char* config, struct context_t* ctx, char* stre
 	ctx->sent 			= 0;
 	ctx->pts 			= 0;
 	ctx->prev_pts 		= 0;
-	ctx->segment_duration = 120000;
+	ctx->segment_duration = get_safe_integer(ctx->cfg, "SegmentDuration", 120000); // default chunk size is 2 min
 	ctx->segment		= 0;
 	ctx->eos			= 0;
 	ctx->n_iframes		= 0;
