@@ -51,8 +51,8 @@ module AP_MODULE_DECLARE_DATA sc_module;
 
 
 typedef struct context_t{
-	char 	audio_buffer[32000];
-	char 	video_buffer[200000];
+	char 	audio_buffer[100000];
+	char 	video_buffer[1000000];
 
 
 	char* 	buffer;
@@ -207,6 +207,7 @@ int send_segment(request_rec* r, struct context_t* ctx, char* data, int len){
 	snprintf(segmentNumber, sizeof(segmentNumber), "%d", ctx->segment );
 
 	snprintf(content_name, sizeof(content_name), "%s.webm", ctx->stream_name);
+	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: content name=%s, data size=%d\n", content_name, (int)len);
 
 	if (vb_api_url && version && apikey && password )
 	{
@@ -260,7 +261,7 @@ int context_init(request_rec* r, char* config, struct context_t* ctx, char* stre
 	ctx->n_iframes		= 0;
 	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Open configuration file %s", config);
 	ctx->cfg 			= load_config(r, ctx, config);
-	ctx->buffer_size 	= get_safe_integer(ctx->cfg, "BufferSize", 1000000);
+	ctx->buffer_size 	= get_safe_integer(ctx->cfg, "BufferSize", 2000000);
 	ctx->buffer 		= apr_palloc(r->connection->pool, ctx->buffer_size);
 	ctx->stream_name	= apr_palloc(r->connection->pool, strlen(stream_name)+1);
 	ctx->no_video		= strcasecmp(get_safe_string(ctx->cfg, "noVideo", "false"), "true") == 0;
@@ -496,14 +497,27 @@ void write_audio(uint8_t* buffer, int len, int pts, int stream_index, AVFormatCo
 	write_packet(ctx, &packet);
 }
 
+//#define LOG_ON
 
 int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
+#ifdef LOG_ON
+    	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Process post, input data len=%d", len);
+#endif
 
 	if (!ctx->format_ctx){
-		 if (!CreateOutputContainer(r, &ctx->format_ctx, ctx->no_video)){
-		    	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
+#ifdef LOG_ON
+		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Creating format context");
+#endif
+
+		 if (!CreateOutputContainer(r, &ctx->format_ctx, ctx->no_video) || ctx->format_ctx == NULL){
+		 	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Faile to create format context");
+
 		 }
 	}
+#ifdef LOG_ON
+	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Current buffer size=%d, pts=%d, eos=%d", (int)ctx->buffer_pos + len, (int)ctx->pts, (int)ctx->eos);
+#endif
+	
 	if (!ctx->eos){
 		memcpy(&ctx->buffer[ctx->buffer_pos], data, len);
 		ctx->buffer_pos += len;
@@ -517,12 +531,17 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 		//1 byte is the packet type
 		//4 bytes is the packet index
 		//4 bytes is the packet length
-		if (len < 1 + 4 + 4){
-			break;
-		}
+
 		unsigned int type = (unsigned char)data[0];
 		unsigned int index = ((unsigned int*)&data[1])[0];
 		unsigned int clen = ((unsigned int*)&data[1+4])[0];
+#ifdef LOG_ON
+		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: input data len=%d, clen=%d", (int)len, (int)clen);
+#endif
+
+		if (len < 1 + 4 + 4){
+			break;
+		}
 
 		if ( len  < clen + 1 + 4 + 4){
 			break;
@@ -530,9 +549,15 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 
 		data += 1+4+4;
 
+#ifdef LOG_ON
+		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Message len=%d, type=%d", (int)clen, (int)type);
+#endif
+
 		switch(type){
 			case 0x00://control;
 				{
+//					ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Control message");
+
 					unsigned int cc = (unsigned char)data[0];
 					if (cc == 0xFF){
 						ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: found end of stream");
@@ -546,6 +571,9 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 						char* buffer = NULL;
 						ctx->n_iframes = 0;
 						int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
+#ifdef LOG_ON
+				    		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment (audio) %d", stream_len);
+#endif
 
 						if (stream_len > 0 && buffer){
 							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment size(non final) %d", stream_len);
@@ -563,6 +591,11 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 					}
 				}
 				if (ctx->n_iframes > 0 || ctx->no_video){
+
+#ifdef LOG_ON
+					ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Writing audio packet, size=%d, pts=%d", clen, ctx->pts);
+#endif
+					
 					write_audio(data, clen, ctx->pts, ctx->no_video ? 0 : 1, ctx->format_ctx);
 				}
 
@@ -573,10 +606,13 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 				break;
 			case 0x90://video
 				if ((data[0] & 0x01) == 0){ //I frame
-					if (ctx->pts - ctx->prev_pts > ctx->segment_duration){
+					if (ctx->pts - ctx->prev_pts > ctx->segment_duration && !ctx->no_video){
 						char* buffer = NULL;
 						ctx->n_iframes = 0;
 						int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
+#ifdef LOG_ON
+				    		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment (video) %d", stream_len);
+#endif
 
 						if (stream_len > 0 && buffer){
 							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment size(non final) %d", stream_len);
@@ -604,8 +640,9 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 		len  -= 1 + 4 + 4 + clen;
 	}
 
-	if ( data != ctx->buffer && len > 0){
-		memmove(ctx->buffer, data, len);
+	if ( len > 0){	
+		if (ctx->buffer != data)
+			memmove(ctx->buffer, data, len);
 		ctx->buffer_pos = len;
 	} else
 		ctx->buffer_pos = 0;
