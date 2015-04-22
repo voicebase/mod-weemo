@@ -278,7 +278,7 @@ apr_status_t context_close( void* ctx){
 
 	context->eos = 1;
 
-	if (ctx->format_ctx == NULL){
+	if (context->format_ctx == NULL){
 		char* tail_filename = get_safe_string(context->cfg, "TailFile", NULL);
 
 		char* buffer = NULL;
