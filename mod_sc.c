@@ -250,7 +250,7 @@ int send_segment(request_rec* r, struct context_t* ctx, char* data, int len){
 	}
 }
 int context_init(request_rec* r, char* config, struct context_t* ctx, char* stream_name){
-
+	int len;
 	ctx->buffer_pos 	= 0;
 	ctx->sent 			= 0;
 	ctx->pts 			= 0;
@@ -267,6 +267,12 @@ int context_init(request_rec* r, char* config, struct context_t* ctx, char* stre
 	ctx->no_video		= strcasecmp(get_safe_string(ctx->cfg, "noVideo", "false"), "true") == 0;
 	ctx->r  			= r;
 	strcpy(ctx->stream_name, stream_name);
+	len = strlen(ctx->stream_name);
+	for(int i = 0; i < len; ++i){
+		if (ctx->stream_name[i] == ':'){
+			ctx->stream_name[i] = '-';
+		}
+	}
 	return 0;
 }
 
