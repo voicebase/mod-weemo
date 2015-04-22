@@ -276,45 +276,43 @@ apr_status_t context_close( void* ctx){
 
 	struct context_t* context = (context_t*)ctx;
 
-	if (context->eos == 0){
-		context->eos = 1;
+	context->eos = 1;
 
-		if (ctx->format_ctx == NULL){
-			char* tail_filename = get_safe_string(context->cfg, "TailFile", NULL);
+	if (ctx->format_ctx == NULL){
+		char* tail_filename = get_safe_string(context->cfg, "TailFile", NULL);
 
-			char* buffer = NULL;
-			int buffer_len = 0;
-			FILE* f = fopen(tail_filename, "rb");
-			if (f){
-				fseek(f, 0, SEEK_END);
-				buffer_len = ftell(f);
-				fseek(f, 0, SEEK_SET);
-				buffer = (char*)malloc(buffer_len);
-				fread(buffer, buffer_len, 1, f);
-				fclose(f);
-			}
-
-			send_segment(context->r, context, buffer, buffer_len);
-
-			if (buffer){
-				free(buffer);
-			}
-		}else{
-			uint8_t* buffer = NULL;
-			int stream_len = CloseOutputContainer(context->format_ctx, &buffer);
-			if (stream_len > 0 && buffer){
-				ap_log_error(APLOG_MARK, APLOG_WARNING, 0, context->r->server, "mod_sc: Output segment size %d", stream_len);
-
-				send_segment(context->r, ctx, buffer, stream_len);
-				av_free(buffer);
-			}
-			context->format_ctx = NULL;
+		char* buffer = NULL;
+		int buffer_len = 0;
+		FILE* f = fopen(tail_filename, "rb");
+		if (f){
+			fseek(f, 0, SEEK_END);
+			buffer_len = ftell(f);
+			fseek(f, 0, SEEK_SET);
+			buffer = (char*)malloc(buffer_len);
+			fread(buffer, buffer_len, 1, f);
+			fclose(f);
 		}
 
-		if (context->cfg){
-			cJSON_Delete(context->cfg);
-			context->cfg = NULL;
+		send_segment(context->r, context, buffer, buffer_len);
+
+		if (buffer){
+			free(buffer);
 		}
+	}else{
+		uint8_t* buffer = NULL;
+		int stream_len = CloseOutputContainer(context->format_ctx, &buffer);
+		if (stream_len > 0 && buffer){
+			ap_log_error(APLOG_MARK, APLOG_WARNING, 0, context->r->server, "mod_sc: Output segment size %d", stream_len);
+
+			send_segment(context->r, ctx, buffer, stream_len);
+			av_free(buffer);
+		}
+		context->format_ctx = NULL;
+	}
+
+	if (context->cfg){
+		cJSON_Delete(context->cfg);
+		context->cfg = NULL;
 	}
 
 	return APR_SUCCESS;
