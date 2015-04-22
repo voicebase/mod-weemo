@@ -277,9 +277,27 @@ apr_status_t context_close( void* ctx){
 	struct context_t* context = (context_t*)ctx;
 
 	if (context->eos == 0){
+		char* tail_filename = get_safe_string(context->cfg, "TailFile", NULL);
 		context->eos = 1;
 
-		send_segment(context->r, context, NULL, 0);
+		char* buffer = NULL;
+		int buffer_len = 0;
+		FILE* f = fopen(tail_filename, "rb");
+		if (f){
+			fseek(f, 0, SEEK_END);
+			buffer_len = ftell(f);
+			fseek(f, 0, SEEK_SET);
+			buffer = (char*)malloc(buffer_len);
+			fread(buffer, buffer_len, 1, f);
+			fclose(f);
+		}
+
+		send_segment(context->r, context, buffer, buffer_len);
+
+		if (buffer){
+			free(buffer);
+		}
+
 		if (context->cfg){
 			cJSON_Delete(context->cfg);
 			context->cfg = NULL;
