@@ -255,7 +255,6 @@ int context_init(request_rec* r, char* config, struct context_t* ctx, char* stre
 	ctx->sent 			= 0;
 	ctx->pts 			= 0;
 	ctx->prev_pts 		= 0;
-	ctx->segment_duration = get_safe_integer(ctx->cfg, "SegmentDuration", 120000); // default chunk size is 2 min
 	ctx->segment		= 0;
 	ctx->eos			= 0;
 	ctx->n_iframes		= 0;
@@ -264,6 +263,8 @@ int context_init(request_rec* r, char* config, struct context_t* ctx, char* stre
 	ctx->buffer_size 	= get_safe_integer(ctx->cfg, "BufferSize", 2000000);
 	ctx->buffer 		= apr_palloc(r->connection->pool, ctx->buffer_size);
 	ctx->stream_name	= apr_palloc(r->connection->pool, strlen(stream_name)+1);
+	ctx->segment_duration = get_safe_integer(ctx->cfg, "SegmentDuration", 120000); // default chunk size is 2 min
+
 	ctx->no_video		= strcasecmp(get_safe_string(ctx->cfg, "noVideo", "false"), "true") == 0;
 	ctx->r  			= r;
 	strcpy(ctx->stream_name, stream_name);
