@@ -72,6 +72,7 @@ typedef struct context_t{
 	int 	n_iframes;
 	char* 	cfg_data;
 	int 	no_video;
+	int 	segment_by_speaker;
 	AVFormatContext* format_ctx;
 	request_rec* r;
 } context_t;
@@ -264,6 +265,7 @@ int context_init(request_rec* r, char* config, struct context_t* ctx, char* stre
 	ctx->buffer 		= apr_palloc(r->connection->pool, ctx->buffer_size);
 	ctx->stream_name	= apr_palloc(r->connection->pool, strlen(stream_name)+1);
 	ctx->segment_duration = get_safe_integer(ctx->cfg, "SegmentDuration", 120000); // default chunk size is 2 min
+	ctx->segment_by_speaker = get_safe_integer(ctx->cfg, "SegmentBySpeaker", 0);
 
 	ctx->no_video		= strcasecmp(get_safe_string(ctx->cfg, "noVideo", "false"), "true") == 0;
 	ctx->r  			= r;
@@ -535,6 +537,30 @@ void write_audio(uint8_t* buffer, int len, int pts, int stream_index, AVFormatCo
 
 //#define LOG_ON
 
+void send_chunk(request_rec* r, struct context_t* ctx){
+	char* buffer = NULL;
+	ctx->n_iframes = 0;
+	int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
+#ifdef LOG_ON
+		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment (audio) %d", stream_len);
+#endif
+
+	if (stream_len > 0 && buffer){
+		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment size(non final) %d", stream_len);
+
+		send_segment(r, ctx, buffer, stream_len);
+
+		av_free(buffer);
+	}
+
+	ctx->format_ctx = NULL;
+	if (!CreateOutputContainer(r, &ctx->format_ctx, ctx->no_video)){
+		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
+	}
+	ctx->prev_pts = ctx->pts;
+}
+
+
 int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 #ifdef LOG_ON
     	ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Process post, input data len=%d", len);
@@ -599,31 +625,15 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 						ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: found end of stream");
 						ctx->eos = 1;
 					}
+					if (cc == 0x42 && ctx->segment_by_speaker){
+						send_chunk(r, ctx);
+					}
 				}
 				break;
 			case 0x80://audio
 				if (ctx->no_video){
 					if (ctx->pts - ctx->prev_pts > ctx->segment_duration){
-						char* buffer = NULL;
-						ctx->n_iframes = 0;
-						int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
-#ifdef LOG_ON
-				    		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment (audio) %d", stream_len);
-#endif
-
-						if (stream_len > 0 && buffer){
-							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment size(non final) %d", stream_len);
-
-							send_segment(r, ctx, buffer, stream_len);
-
-							av_free(buffer);
-						}
-
-						ctx->format_ctx = NULL;
-						if (!CreateOutputContainer(r, &ctx->format_ctx, ctx->no_video)){
-							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
-						}
-						ctx->prev_pts = ctx->pts;
+						send_chunk(r, ctx);
 					}
 				}
 				if (ctx->n_iframes > 0 || ctx->no_video){
@@ -643,25 +653,7 @@ int process_data(request_rec* r, struct context_t* ctx, char* data, int len){
 			case 0x90://video
 				if ((data[0] & 0x01) == 0){ //I frame
 					if (ctx->pts - ctx->prev_pts > ctx->segment_duration && !ctx->no_video){
-						char* buffer = NULL;
-						ctx->n_iframes = 0;
-						int stream_len = CloseOutputContainer(ctx->format_ctx, &buffer);
-#ifdef LOG_ON
-				    		ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment (video) %d", stream_len);
-#endif
-
-						if (stream_len > 0 && buffer){
-							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Output segment size(non final) %d", stream_len);
-							send_segment(r, ctx, buffer, stream_len);
-
-							av_free(buffer);
-						}
-
-						ctx->format_ctx = NULL;
-						if (!CreateOutputContainer(r, &ctx->format_ctx, ctx->no_video)){
-							ap_log_error(APLOG_MARK, APLOG_WARNING, 0, r->server, "mod_sc: Can't create memory container");
-						}
-						ctx->prev_pts = ctx->pts;
+						send_chunk(r, ctx);
 					}
 					++ctx->n_iframes;
 				}
